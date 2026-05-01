@@ -1,0 +1,91 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helpers ──────────────────────────────────────────────────────
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+    function isAdmin() {
+      return isSignedIn() && request.auth.token.email == 'admin@huzurbahcesi.app';
+    }
+
+    // ── All app data lives under artifacts/{appId}/ ──────────────────
+    match /artifacts/{appId} {
+
+      // Per-user private collections
+      match /users/{userId} {
+
+        match /profile/data {
+          allow read, write: if isOwner(userId) || isAdmin();
+        }
+
+        match /relatives/{relativeId} {
+          allow read, write: if isOwner(userId) || isAdmin();
+        }
+
+        // Notifications: user can read & mark as read; any auth user can create
+        match /notifications/{notifId} {
+          allow read:          if isOwner(userId) || isAdmin();
+          allow create:        if isSignedIn();
+          allow update:        if isOwner(userId)
+                               && request.resource.data.diff(resource.data).affectedKeys()
+                                    .hasOnly(['read']);
+          allow delete:        if isOwner(userId) || isAdmin();
+        }
+
+        // Coupons: user can read; user can only mark as used; admin/CF creates
+        match /coupons/{couponId} {
+          allow read:          if isOwner(userId) || isAdmin();
+          allow update:        if isOwner(userId)
+                               && request.resource.data.diff(resource.data).affectedKeys()
+                                    .hasOnly(['used'])
+                               && request.resource.data.used == true;
+          allow create, delete: if isAdmin();
+        }
+      }
+
+      // Shared public data
+      match /public/data {
+
+        // Orders: only Cloud Functions (or admin) create iyzico orders;
+        // transfer orders may be created directly by the authenticated user.
+        match /orders/{orderId} {
+          allow read:   if isSignedIn();
+          // Allow direct Firestore writes only for non-iyzico (transfer) payments.
+          // Iyzico orders are created server-side by the Cloud Function.
+          allow create: if isSignedIn()
+                        && request.resource.data.userId == request.auth.uid
+                        && request.resource.data.paymentMethod != 'iyzico';
+          allow update: if isSignedIn();
+          allow delete: if isAdmin();
+        }
+
+        // Product catalogue: publicly readable, vendors/admin can write
+        match /products/{productId} {
+          allow read:          if true;
+          allow create, update: if isSignedIn();
+          allow delete:        if isAdmin();
+        }
+
+        // Before/after reference photos: publicly readable
+        match /references/{referenceId} {
+          allow read:          if true;
+          allow create, update: if isSignedIn();
+          allow delete:        if isAdmin();
+        }
+
+        // Vendor onboarding applications
+        match /vendor_applications/{appDocId} {
+          allow read:   if isAdmin();
+          allow create: if isSignedIn();
+          allow update: if isAdmin();
+          allow delete: if isAdmin();
+        }
+      }
+    }
+  }
+}

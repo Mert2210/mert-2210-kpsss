@@ -42,6 +42,7 @@ import {
   updateDoc,
   getDocs
 } from 'firebase/firestore';
+import { getFunctions, httpsCallable } from 'firebase/functions';
 
 // --- SABİT TANITIM VERİLERİ ---
 const initialRelatives = [
@@ -68,6 +69,7 @@ const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__f
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
+const functions = getFunctions(app, 'europe-west1'); // Cloud Functions region
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'huzurbahcesi-v1';
 
 // --- GERÇEK ZAMANLI İNTERAKTİF HARİTA BİLEŞENİ ---
@@ -205,6 +207,13 @@ export default function App() {
   const [orderPlaced, setOrderPlaced] = useState(false);
   const [isAnniversaryDismissed, setIsAnniversaryDismissed] = useState(false); 
   const [paymentMethod, setPaymentMethod] = useState('iyzico');
+
+  // Kart Bilgileri (yalnızca iyzico akışında kullanılır; hiçbir zaman Firestore'a yazılmaz)
+  const [cardHolder, setCardHolder] = useState('');
+  const [cardNumber, setCardNumber] = useState('');
+  const [cardExpiry, setCardExpiry] = useState('');  // "MM/YYYY"
+  const [cardCvc, setCardCvc]       = useState('');
+  const [checkoutError, setCheckoutError] = useState('');
 
   // Aile İle Ortak Ödeme
   const [isFamilyShareOpen, setIsFamilyShareOpen] = useState(false);
@@ -620,7 +629,6 @@ export default function App() {
   };
 
   const openFamilyShareModal = () => {
-    setFamilyShareAmount(Math.round(totalCartPrice / 2));
     setIsFamilyShareOpen(true);
   };
 
@@ -732,58 +740,76 @@ export default function App() {
     } catch(e) { console.error(e); }
   };
 
-  const verifyOrderSecurely = async (total) => {
-    return new Promise((resolve) => setTimeout(() => { resolve({ verified: true, finalPrice: total }); }, 1200));
-  };
-
   const handleCheckout = async () => {
     if (!user || !selectedRelative || isCheckingOut) return;
+    setCheckoutError('');
     setIsCheckingOut(true);
 
-    const orderNo = `HZ-${Math.floor(Math.random()*90000)+10000}`;
     try {
-      const verification = await verifyOrderSecurely(totalCartPrice);
-      if (!verification.verified) { 
-        alert("Ödeme doğrulaması başarısız!"); 
-        setIsCheckingOut(false); 
-        return; 
+      if (paymentMethod === 'iyzico') {
+        // ── Güvenli ödeme: kart bilgileri hiçbir zaman Firestore'a gitmez ──
+        // Tüm doğrulama ve ödeme Cloud Function'da gerçekleşir.
+        const [expireMonth, expireYear] = cardExpiry.split('/').map(s => s.trim());
+        const createIyzicoPayment = httpsCallable(functions, 'createIyzicoPayment');
+        const result = await createIyzicoPayment({
+          cardHolder,
+          cardNumber:  cardNumber.replace(/\s/g, ''),
+          expireMonth,
+          expireYear,
+          cvc:         cardCvc,
+          cart,
+          relativeName:      selectedRelative.name,
+          relativeCemetery:  selectedRelative.cemetery,
+          liveVideoRequested: liveVideo,
+          coupon:    appliedCoupon || null,
+          usePoints,
+          userPoints: huzurPoints,
+        });
+
+        if (!result.data.success) {
+          setCheckoutError('Ödeme başarısız. Lütfen kart bilgilerinizi kontrol edin.');
+          return;
+        }
+      } else {
+        // ── Havale / EFT: doğrudan Firestore yazısı (güvenli – iyzico yok) ──
+        const orderNo = `HZ-${Math.floor(Math.random() * 90000) + 10000}`;
+        const orderRef = await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'orders'), {
+          orderNumber:       orderNo,
+          userId:            user.uid,
+          userName:          user.displayName || 'Üye',
+          userEmail:         user.email || 'E-posta Gizli',
+          date:              new Date().toLocaleDateString('tr-TR'),
+          items:             cart,
+          total:             totalCartPrice,
+          status:            'Ödeme Onayı Bekliyor',
+          relativeName:      selectedRelative.name,
+          relativeCemetery:  selectedRelative.cemetery,
+          liveVideoRequested: liveVideo,
+          paymentMethod:     'transfer',
+          messages:          [],
+          createdAt:         Date.now(),
+        });
+
+        await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'notifications'), {
+          title:     'Sipariş Alındı',
+          message:   `${orderNo} numaralı siparişiniz başarıyla oluşturuldu. Satıcı onayı bekleniyor.`,
+          createdAt: Date.now(),
+          read:      false,
+          orderId:   orderRef.id,
+        });
+
+        if (appliedCoupon && appliedCoupon.id) {
+          try { await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'coupons', appliedCoupon.id), { used: true }); } catch (_) {}
+        }
       }
-
-      const orderRef = await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'orders'), {
-        orderNumber: orderNo, 
-        userId: user.uid,
-        userName: user.displayName || 'Üye',
-        userEmail: user.email || 'E-posta Gizli',
-        date: new Date().toLocaleDateString('tr-TR'),
-        items: cart, 
-        total: verification.finalPrice, 
-        status: paymentMethod === 'iyzico' ? 'Ödeme Havuzda' : 'Ödeme Onayı Bekliyor', 
-        relativeName: selectedRelative.name, 
-        relativeCemetery: selectedRelative.cemetery,
-        liveVideoRequested: liveVideo,
-        paymentMethod: paymentMethod,
-        messages: [],
-        createdAt: Date.now()
-      });
-
-      const messageStr = paymentMethod === 'iyzico' 
-        ? `${orderNo} nolu işleminiz için tutar İyzico güvencesiyle havuza alındı. İş bitiminde satıcıya aktarılacak.` 
-        : `${orderNo} numaralı siparişiniz başarıyla oluşturuldu. Satıcı onayı bekleniyor.`;
-      
-      const titleStr = paymentMethod === 'iyzico' ? 'Ödeme Güvenli Havuzda 🛡️' : 'Sipariş Alındı';
-
-      await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'notifications'), {
-        title: titleStr, message: messageStr, createdAt: Date.now(), read: false, orderId: orderRef.id
-      });
 
       if (usePoints) setHuzurPoints(0);
-      if (appliedCoupon && appliedCoupon.id) {
-         try { await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'coupons', appliedCoupon.id), { used: true }); } catch(err) {}
-      }
       setCart([]); setLiveVideo(false); setOrderPlaced(true); setAppliedCoupon(null);
+      setCardHolder(''); setCardNumber(''); setCardExpiry(''); setCardCvc('');
       setTimeout(() => { setOrderPlaced(false); setIsCartOpen(false); }, 4000);
-    } catch (err) { 
-      console.error(err); 
+    } catch (err) {
+      console.error(err);
+      setCheckoutError(err?.message || 'Beklenmeyen bir hata oluştu. Lütfen tekrar deneyin.');
     } finally {
       setIsCheckingOut(false);
     }
